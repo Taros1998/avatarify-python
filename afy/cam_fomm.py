@@ -4,10 +4,14 @@ import glob
 import yaml
 import time
 import requests
-
+import traceback
 import numpy as np
 import cv2
-
+import pyaudio
+import wave
+import threading
+import subprocess
+from audioRecorder import AudioRecorder
 from afy.videocaptureasync import VideoCaptureAsync
 from afy.arguments import opt
 from afy.utils import info, Once, Tee, crop, pad_img, resize, TicToc
@@ -24,6 +28,14 @@ if _platform == 'darwin':
         info('\nOnly remote GPU mode is supported for Mac (use --is-client and --connect options to connect to the server)')
         info('Standalone version will be available lately!\n')
         exit()
+
+
+def start_audio_recording():
+
+    global audio_thread
+
+    audio_thread = AudioRecorder()
+    audio_thread.start()
 
 
 def is_new_frame_better(source, driving, predictor):
@@ -218,272 +230,362 @@ if __name__ == "__main__":
             **predictor_args
         )
 
-    cam_id = select_camera(config)
+    
+    #videoWriter
+    height = 512
+    width = 512
 
-    if cam_id is None:
-        exit(1)
+    # 使用 XVID 編碼
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 
-    cap = VideoCaptureAsync(cam_id)
-    cap.start()
+
 
     avatars, avatar_names = load_images()
-
-    enable_vcam = not opt.no_stream
-
-    ret, frame = cap.read()
-    stream_img_size = frame.shape[1], frame.shape[0]
-
-    if enable_vcam:
-        if _platform in ['linux', 'linux2']:
-            try:
-                import pyfakewebcam
-            except ImportError:
-                log("pyfakewebcam is not installed.")
-                exit(1)
-
-            stream = pyfakewebcam.FakeWebcam(f'/dev/video{opt.virt_cam}', *stream_img_size)
-        else:
-            enable_vcam = False
-            # log("Virtual camera is supported only on Linux.")
-        
-        # if not enable_vcam:
-            # log("Virtual camera streaming will be disabled.")
-
-    cur_ava = 0    
-    avatar = None
-    change_avatar(predictor, avatars[cur_ava])
-    passthrough = False
-
-    cv2.namedWindow('cam', cv2.WINDOW_GUI_NORMAL)
-    cv2.moveWindow('cam', 500, 250)
+    
 
     frame_proportion = 0.9
     frame_offset_x = 0
     frame_offset_y = 0
 
-    overlay_alpha = 0.0
-    preview_flip = False
-    output_flip = False
-    find_keyframe = False
-    is_calibrated = False
+    cur_ava = 3
 
-    show_landmarks = False
 
-    fps_hist = []
-    fps = 0
-    show_fps = False
+    #video or cam
+    if opt.is_video:
+        try:
 
-    print_help()
-
-    try:
-        while True:
-            tt = TicToc()
-
-            timing = {
-                'preproc': 0,
-                'predict': 0,
-                'postproc': 0
-            }
-
-            green_overlay = False
-
-            tt.tic()
-
-            ret, frame = cap.read()
-            if not ret:
-                log("Can't receive frame (stream end?). Exiting ...")
-                break
-
-            frame = frame[..., ::-1]
-            frame_orig = frame.copy()
-
-            frame, (frame_offset_x, frame_offset_y) = crop(frame, p=frame_proportion, offset_x=frame_offset_x, offset_y=frame_offset_y)
-
-            frame = resize(frame, (IMG_SIZE, IMG_SIZE))[..., :3]
-
-            if find_keyframe:
-                if is_new_frame_better(avatar, frame, predictor):
-                    log("Taking new frame!")
-                    green_overlay = True
-                    predictor.reset_frames()
-
-            timing['preproc'] = tt.toc()
-
-            if passthrough:
-                out = frame
-            elif is_calibrated:
-                tt.tic()
-                out = predictor.predict(frame)
-                if out is None:
-                    log('predict returned None')
-                timing['predict'] = tt.toc()
-            else:
-                out = None
-
-            tt.tic()
-            
-            key = cv2.waitKey(1)
-
-            if cv2.getWindowProperty('cam', cv2.WND_PROP_VISIBLE) < 1.0:
-                break
-            elif is_calibrated and cv2.getWindowProperty('avatarify', cv2.WND_PROP_VISIBLE) < 1.0:
-                break
-
-            if key == 27: # ESC
-                break
-            elif key == ord('d'):
-                cur_ava += 1
-                if cur_ava >= len(avatars):
-                    cur_ava = 0
-                passthrough = False
-                change_avatar(predictor, avatars[cur_ava])
-            elif key == ord('a'):
-                cur_ava -= 1
-                if cur_ava < 0:
-                    cur_ava = len(avatars) - 1
-                passthrough = False
-                change_avatar(predictor, avatars[cur_ava])
-            elif key == ord('w'):
-                frame_proportion -= 0.05
-                frame_proportion = max(frame_proportion, 0.1)
-            elif key == ord('s'):
-                frame_proportion += 0.05
-                frame_proportion = min(frame_proportion, 1.0)
-            elif key == ord('H'):
-                frame_offset_x -= 1
-            elif key == ord('h'):
-                frame_offset_x -= 5
-            elif key == ord('K'):
-                frame_offset_x += 1
-            elif key == ord('k'):
-                frame_offset_x += 5
-            elif key == ord('J'):
-                frame_offset_y -= 1
-            elif key == ord('j'):
-                frame_offset_y -= 5
-            elif key == ord('U'):
-                frame_offset_y += 1
-            elif key == ord('u'):
-                frame_offset_y += 5
-            elif key == ord('Z'):
-                frame_offset_x = 0
-                frame_offset_y = 0
-                frame_proportion = 0.9
-            elif key == ord('x'):
-                predictor.reset_frames()
-
-                if not is_calibrated:
-                    cv2.namedWindow('avatarify', cv2.WINDOW_GUI_NORMAL)
-                    cv2.moveWindow('avatarify', 600, 250)
+            # 建立 VideoWriter 物件，輸出影片成 mp4檔
+            # FPS 值為 25.0，解析度為 512x512
+            inference_output = cv2.VideoWriter('video_output.mp4', fourcc, 15.0, (width, height))
+            record_flag = False
+            avatar = None
+            change_avatar(predictor, avatars[cur_ava])
+            cap = cv2.VideoCapture(r"C:\Users\taros\avatarify-python\input.mp4")
+            while(cap.isOpened()):
                 
-                is_calibrated = True
-                show_landmarks = False
-            elif key == ord('z'):
-                overlay_alpha = max(overlay_alpha - 0.1, 0.0)
-            elif key == ord('c'):
-                overlay_alpha = min(overlay_alpha + 0.1, 1.0)
-            elif key == ord('r'):
-                preview_flip = not preview_flip
-            elif key == ord('t'):
-                output_flip = not output_flip
-            elif key == ord('f'):
-                find_keyframe = not find_keyframe
-            elif key == ord('o'):
-                show_landmarks = not show_landmarks
-            elif key == ord('q'):
+                ret, frame = cap.read()
+                if ret:
+                    log("reading frame")
+                    frame = frame[..., ::-1]
+                    frame_orig = frame.copy()
+
+
+                    frame, (frame_offset_x, frame_offset_y) = crop(frame, p=frame_proportion, offset_x=frame_offset_x, offset_y=frame_offset_y)
+                    frame = resize(frame, (IMG_SIZE, IMG_SIZE))[..., :3]
+
+                    out = predictor.predict(frame)
+                    if out is not None:
+                        if not opt.no_pad:
+                            out = pad_img(out, stream_img_size)
+
+                        output_frame = cv2.resize(out[..., ::-1], (width, height))
+                        # 寫入影格
+                        inference_output.write(output_frame)
+                else:
+                    log("stopping process")
+                    inference_output.release()
+                    cv2.destroyAllWindows()
+
+                    if opt.is_client:
+                        log("stopping remote predictor")
+                        predictor.stop()
+
+                    log("main: exit")
+                    break
+                    
+        except :
+            traceback.print_exc()
+
+
+
+
+    else:
+        # 建立 VideoWriter 物件，輸出影片成 mp4檔
+        # FPS 值為 25.0，解析度為 512x512
+        original_output = cv2.VideoWriter('input.mp4', fourcc, 15.0, (width, height))
+        inference_output = cv2.VideoWriter('camera_output.mp4', fourcc, 15.0, (width, height))
+        record_flag = False
+        cam_id = select_camera(config)
+
+        if cam_id is None:
+            exit(1)
+
+        
+        cap = VideoCaptureAsync(cam_id)
+        cap.start()
+        
+
+        enable_vcam = not opt.no_stream
+
+        ret, frame = cap.read()
+        stream_img_size = frame.shape[1], frame.shape[0]
+
+        if enable_vcam:
+            if _platform in ['linux', 'linux2']:
                 try:
-                    log('Loading StyleGAN avatar...')
-                    avatar = load_stylegan_avatar()
-                    passthrough = False
-                    change_avatar(predictor, avatar)
-                except:
-                    log('Failed to load StyleGAN avatar')
-            elif key == ord('l'):
-                try:
-                    log('Reloading avatars...')
-                    avatars, avatar_names = load_images()
-                    passthrough = False
-                    log("Images reloaded")
-                except:
-                    log('Image reload failed')
-            elif key == ord('i'):
-                show_fps = not show_fps
-            elif 48 < key < 58:
-                cur_ava = min(key - 49, len(avatars) - 1)
-                passthrough = False
-                change_avatar(predictor, avatars[cur_ava])
-            elif key == 48:
-                passthrough = not passthrough
-            elif key != -1:
-                log(key)
+                    import pyfakewebcam
+                except ImportError:
+                    log("pyfakewebcam is not installed.")
+                    exit(1)
 
-            if overlay_alpha > 0:
-                preview_frame = cv2.addWeighted( avatar, overlay_alpha, frame, 1.0 - overlay_alpha, 0.0)
+                stream = pyfakewebcam.FakeWebcam(f'/dev/video{opt.virt_cam}', *stream_img_size)
             else:
-                preview_frame = frame.copy()
-
-            if show_landmarks:
-                # Dim the background to make it easier to see the landmarks
-                preview_frame = cv2.convertScaleAbs(preview_frame, alpha=0.5, beta=0.0)
-
-                draw_face_landmarks(preview_frame, avatar_kp, (200, 20, 10))
-                frame_kp = predictor.get_frame_kp(frame)
-                draw_face_landmarks(preview_frame, frame_kp)
+                enable_vcam = False
+                # log("Virtual camera is supported only on Linux.")
             
-            if preview_flip:
-                preview_frame = cv2.flip(preview_frame, 1)
-                
-            if green_overlay:
-                green_alpha = 0.8
-                overlay = preview_frame.copy()
-                overlay[:] = (0, 255, 0)
-                preview_frame = cv2.addWeighted( preview_frame, green_alpha, overlay, 1.0 - green_alpha, 0.0)
+            # if not enable_vcam:
+                # log("Virtual camera streaming will be disabled.")
+        
+        avatar = None
+        change_avatar(predictor, avatars[cur_ava])
+        passthrough = False
 
-            timing['postproc'] = tt.toc()
-                
-            if find_keyframe:
-                preview_frame = cv2.putText(preview_frame, display_string, (10, 220), 0, 0.5 * IMG_SIZE / 256, (255, 255, 255), 1)
+        cv2.namedWindow('cam', cv2.WINDOW_GUI_NORMAL)
+        cv2.moveWindow('cam', 500, 250)
 
-            if show_fps:
-                preview_frame = draw_fps(preview_frame, fps, timing)
 
-            if not is_calibrated:
-                preview_frame = draw_calib_text(preview_frame)
-            elif show_landmarks:
-                preview_frame = draw_landmark_text(preview_frame)
 
-            if not opt.hide_rect:
-                draw_rect(preview_frame)
+        overlay_alpha = 0.0
+        preview_flip = False
+        output_flip = False
+        find_keyframe = False
+        is_calibrated = False
 
-            cv2.imshow('cam', preview_frame[..., ::-1])
+        show_landmarks = False
 
-            if out is not None:
-                if not opt.no_pad:
-                    out = pad_img(out, stream_img_size)
+        fps_hist = []
+        fps = 0
+        show_fps = False
 
-                if output_flip:
-                    out = cv2.flip(out, 1)
+        print_help()
 
-                if enable_vcam:
-                    out = resize(out, stream_img_size)
-                    stream.schedule_frame(out)
 
-                cv2.imshow('avatarify', out[..., ::-1])
+        try:
+            while True:
+                    tt = TicToc()
 
-            fps_hist.append(tt.toc(total=True))
-            if len(fps_hist) == 10:
-                fps = 10 / (sum(fps_hist) / 1000)
-                fps_hist = []
-    except KeyboardInterrupt:
-        log("main: user interrupt")
+                    timing = {
+                        'preproc': 0,
+                        'predict': 0,
+                        'postproc': 0
+                    }
 
-    log("stopping camera")
-    cap.stop()
+                    green_overlay = False
 
-    cv2.destroyAllWindows()
+                    tt.tic()
 
-    if opt.is_client:
-        log("stopping remote predictor")
-        predictor.stop()
+                    ret, frame = cap.read()
+                    if not ret:
+                        log("Can't receive frame (stream end?). Exiting ...")
+                        break
 
-    log("main: exit")
+                    frame = frame[..., ::-1]
+                    frame_orig = frame.copy()
+
+
+                    frame, (frame_offset_x, frame_offset_y) = crop(frame, p=frame_proportion, offset_x=frame_offset_x, offset_y=frame_offset_y)
+                    if record_flag == True:
+                        input_frame = cv2.resize(frame[..., ::-1], (width, height))
+                        # 寫入影格
+                        original_output.write(input_frame)
+
+                    frame = resize(frame, (IMG_SIZE, IMG_SIZE))[..., :3]
+
+                    if find_keyframe:
+                        if is_new_frame_better(avatar, frame, predictor):
+                            log("Taking new frame!")
+                            green_overlay = True
+                            predictor.reset_frames()
+
+                    timing['preproc'] = tt.toc()
+
+                    if passthrough:
+                        out = frame
+                    elif is_calibrated:
+                        tt.tic()
+                        out = predictor.predict(frame)
+                        if out is None:
+                            log('predict returned None')
+                        timing['predict'] = tt.toc()
+                    else:
+                        out = None
+
+                    tt.tic()
+                    
+                    key = cv2.waitKey(1)
+
+                    if cv2.getWindowProperty('cam', cv2.WND_PROP_VISIBLE) < 1.0:
+                        break
+                    elif is_calibrated and cv2.getWindowProperty('avatarify', cv2.WND_PROP_VISIBLE) < 1.0:
+                        break
+
+                    if key == 27: # ESC
+                        break
+                    elif key == ord('d'):
+                        cur_ava += 1
+                        if cur_ava >= len(avatars):
+                            cur_ava = 0
+                        passthrough = False
+                        change_avatar(predictor, avatars[cur_ava])
+                    elif key == ord('a'):
+                        cur_ava -= 1
+                        if cur_ava < 0:
+                            cur_ava = len(avatars) - 1
+                        passthrough = False
+                        change_avatar(predictor, avatars[cur_ava])
+                    elif key == ord('w'):
+                        frame_proportion -= 0.05
+                        frame_proportion = max(frame_proportion, 0.1)
+                    elif key == ord('s'):
+                        frame_proportion += 0.05
+                        frame_proportion = min(frame_proportion, 1.0)
+                    elif key == ord('H'):
+                        frame_offset_x -= 1
+                    elif key == ord('h'):
+                        frame_offset_x -= 5
+                    elif key == ord('K'):
+                        frame_offset_x += 1
+                    elif key == ord('k'):
+                        frame_offset_x += 5
+                    elif key == ord('J'):
+                        frame_offset_y -= 1
+                    elif key == ord('j'):
+                        frame_offset_y -= 5
+                    elif key == ord('U'):
+                        frame_offset_y += 1
+                    elif key == ord('u'):
+                        frame_offset_y += 5
+                    elif key == ord('Z'):
+                        frame_offset_x = 0
+                        frame_offset_y = 0
+                        frame_proportion = 0.9
+                    elif key == ord('x'):
+                        record_flag = True
+                        start_audio_recording()
+                        log('start recording...')
+                        predictor.reset_frames()
+
+                        if not is_calibrated:
+                            cv2.namedWindow('avatarify', cv2.WINDOW_GUI_NORMAL)
+                            cv2.moveWindow('avatarify', 600, 250)
+                        
+                        is_calibrated = True
+                        show_landmarks = False
+                    elif key == ord('z'):
+                        overlay_alpha = max(overlay_alpha - 0.1, 0.0)
+                    elif key == ord('c'):
+                        overlay_alpha = min(overlay_alpha + 0.1, 1.0)
+                    elif key == ord('r'):
+                        preview_flip = not preview_flip
+                    elif key == ord('t'):
+                        output_flip = not output_flip
+                    elif key == ord('f'):
+                        find_keyframe = not find_keyframe
+                    elif key == ord('o'):
+                        show_landmarks = not show_landmarks
+                    elif key == ord('q'):
+                        try:
+                            log('Loading StyleGAN avatar...')
+                            avatar = load_stylegan_avatar()
+                            passthrough = False
+                            change_avatar(predictor, avatar)
+                        except:
+                            log('Failed to load StyleGAN avatar')
+                    elif key == ord('l'):
+                        try:
+                            log('Reloading avatars...')
+                            avatars, avatar_names = load_images()
+                            passthrough = False
+                            log("Images reloaded")
+                        except:
+                            log('Image reload failed')
+                    elif key == ord('i'):
+                        show_fps = not show_fps
+                    elif 48 < key < 58:
+                        cur_ava = min(key - 49, len(avatars) - 1)
+                        passthrough = False
+                        change_avatar(predictor, avatars[cur_ava])
+                    elif key == 48:
+                        passthrough = not passthrough
+                    elif key != -1:
+                        log(key)
+
+                    if overlay_alpha > 0:
+                        preview_frame = cv2.addWeighted( avatar, overlay_alpha, frame, 1.0 - overlay_alpha, 0.0)
+                    else:
+                        preview_frame = frame.copy()
+
+                    if show_landmarks:
+                        # Dim the background to make it easier to see the landmarks
+                        preview_frame = cv2.convertScaleAbs(preview_frame, alpha=0.5, beta=0.0)
+
+                        draw_face_landmarks(preview_frame, avatar_kp, (200, 20, 10))
+                        frame_kp = predictor.get_frame_kp(frame)
+                        draw_face_landmarks(preview_frame, frame_kp)
+                    
+                    if preview_flip:
+                        preview_frame = cv2.flip(preview_frame, 1)
+                        
+                    if green_overlay:
+                        green_alpha = 0.8
+                        overlay = preview_frame.copy()
+                        overlay[:] = (0, 255, 0)
+                        preview_frame = cv2.addWeighted( preview_frame, green_alpha, overlay, 1.0 - green_alpha, 0.0)
+
+                    timing['postproc'] = tt.toc()
+                        
+                    if find_keyframe:
+                        preview_frame = cv2.putText(preview_frame, display_string, (10, 220), 0, 0.5 * IMG_SIZE / 256, (255, 255, 255), 1)
+
+                    if show_fps:
+                        preview_frame = draw_fps(preview_frame, fps, timing)
+
+                    if not is_calibrated:
+                        preview_frame = draw_calib_text(preview_frame)
+                    elif show_landmarks:
+                        preview_frame = draw_landmark_text(preview_frame)
+
+                    if not opt.hide_rect:
+                        draw_rect(preview_frame)
+
+                    cv2.imshow('cam', preview_frame[..., ::-1])
+
+                    if out is not None:
+                        if not opt.no_pad:
+                            out = pad_img(out, stream_img_size)
+
+                        if output_flip:
+                            out = cv2.flip(out, 1)
+
+                        if enable_vcam:
+                            out = resize(out, stream_img_size)
+                            stream.schedule_frame(out)
+
+                        cv2.imshow('avatarify', out[..., ::-1])
+                        if record_flag == True:
+                            output_frame = cv2.resize(out[..., ::-1], (width, height))
+                            # 寫入影格
+                            inference_output.write(output_frame)
+
+
+                    fps_hist.append(tt.toc(total=True))
+                    if len(fps_hist) == 10:
+                        fps = 10 / (sum(fps_hist) / 1000)
+                        fps_hist = []
+        except KeyboardInterrupt:
+            log("main: user interrupt")
+
+        log("stopping camera")
+        cap.stop()
+        audio_thread.stop()
+        original_output.release()
+        inference_output.release()
+        cv2.destroyAllWindows()
+
+        if opt.is_client:
+            log("stopping remote predictor")
+            predictor.stop()
+        
+
+        log("main: exit")
+
